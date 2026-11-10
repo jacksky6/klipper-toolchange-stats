@@ -4,6 +4,11 @@
 
 这是一个 Klipper 多热端 / 多工具头换头插件。它负责注册 `T0`、`T1` 这类换头命令，并在换头时自动处理当前工具状态、偏移、温度等待、耗材检查、断料续打、换头统计等流程。
 
+对于多个可更换热端共用一套挤出、加热和测温系统的机器，可选用
+`heater_mode: shared`。该模式在机械换头期间停止共享加热，抓取完成并取得新温度采样后再恢复。
+默认的独立热端温控模式不变。配置、命令语义和硬件验证边界见
+[共享加热与测温模式](docs/shared-heater.md)。
+
 安装时可以选择从 [配套 Mainsail 的 GitHub Release](https://github.com/null01024/mainsail-multitool/releases/latest) 下载最新正式版前端。部署后，可以在 Mainsail 中直观看到多工具头状态、耗材状态和换头统计：
 
 ![Mainsail 前端预览](img/web_preview.png)

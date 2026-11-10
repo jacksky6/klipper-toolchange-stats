@@ -8,3 +8,12 @@ local/
 docs/
 tests/
 !README.md
+__pycache__/
+
+# Keep the shared-heater feature's documentation and regression tests in Git.
+!docs/
+docs/*
+!docs/shared-heater.md
+!tests/
+tests/*
+!tests/test_multitool_shared_heater.py

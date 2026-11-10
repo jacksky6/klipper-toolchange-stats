@@ -20,6 +20,7 @@
 # 给宏复用同一套断料续打组目标解析逻辑。
 
 import logging
+import math
 
 PERSIST_CURRENT_TOOL = 'current_tool'
 SPOOL_ID_VAR_TMPL = 'tool_%d_spool_id'
@@ -40,6 +41,19 @@ class Multitool:
 
         # ---- 配置字段 ----
         self.tool_count = config.getint('tool_count', minval=1, maxval=16)
+        self.heater_mode = config.getchoice(
+            'heater_mode', {'per_tool': 'per_tool', 'shared': 'shared'},
+            'per_tool')
+        self.shared_extruder = config.get('shared_extruder', 'extruder').strip()
+        if self.heater_mode == 'shared' and not self.shared_extruder:
+            raise self.printer.config_error(
+                '[multitool] shared_extruder must not be empty')
+        self.shared_heater_off_timeout = config.getfloat(
+            'shared_heater_off_timeout', 5., above=0.)
+        self.shared_heater_sensor_timeout = config.getfloat(
+            'shared_heater_sensor_timeout', 5., above=0.)
+        physical_extruder = (self.shared_extruder
+                             if self.heater_mode == 'shared' else 'extruder')
         self.z_hop = config.getfloat('z_hop', 0.4, minval=0.)
         self.feed_z = config.getint('feed_z', 600, minval=1)
         self.accel_swap = config.getfloat(
@@ -55,9 +69,9 @@ class Multitool:
         self.sync_extruder_motion = config.getboolean(
             'sync_extruder_motion', True)
         self.extruder_motion_sync_stepper = config.get(
-            'extruder_motion_sync_stepper', 'extruder').strip()
+            'extruder_motion_sync_stepper', physical_extruder).strip()
         self.default_pressure_advance_extruder = config.get(
-            'default_pressure_advance_extruder', 'extruder').strip()
+            'default_pressure_advance_extruder', physical_extruder).strip()
         self.extrude_compensation_length = config.getfloat(
             'extrude_compensation_length', 0., minval=0.)
         self.extrude_compensation_speed = config.getfloat(
@@ -73,6 +87,16 @@ class Multitool:
         self.active = False      # 是否正在切换中
         self.change_from_tool = -1
         self.change_to_tool = -1
+        # Shared mode has logical per-tool targets, but only one real heater.
+        # Unset targets inherit the last mounted tool's target on first pickup;
+        # an explicit zero (including TURN_OFF_HEATERS) never inherits heat.
+        self._tool_targets = [0.] * self.tool_count
+        self._tool_target_set = [False] * self.tool_count
+        self._shared_last_target = 0.
+        self._shared_heater = None
+        self._shared_native_set_temp = None
+        self._shared_heater_suspended = True
+        self._shared_heater_fault = False
         self._spool_ids = [0] * self.tool_count
         self._spoolman_sync_warned = False
         self._orca_lane_sync_warned = False
@@ -90,6 +114,9 @@ class Multitool:
             'klippy:connect', self._on_connect)
         self.printer.register_event_handler(
             'klippy:ready', self._on_ready)
+        if self.heater_mode == 'shared':
+            self.printer.register_event_handler(
+                'klippy:shutdown', self._shared_heater_shutdown)
 
     # ------------------------------------------------------------------
     # 启动恢复
@@ -106,6 +133,11 @@ class Multitool:
                     or self.current_tool >= self.tool_count):
                 self.current_tool = -1
             self._load_spool_ids(v)
+
+        if self._shared_heater is not None:
+            # Restore tool identity, never a heating target, after a restart.
+            self._shared_native_set_temp(0.)
+            self._shared_heater_suspended = self.current_tool < 0
 
         # 启动统一的 print_stats.state 轮询定时器（子模块共享）
         reactor = self.printer.get_reactor()
@@ -210,6 +242,8 @@ class Multitool:
             self.cmd_MULTITOOL_WAIT_TEMPERATURE,
             desc='等待工具温度，自动解析断料续打组实际工具')
         self._patch_default_pressure_advance()
+        if self.heater_mode == 'shared':
+            self._configure_shared_heater()
 
     def _make_tool_handler(self, tool_index):
         def _handler(gcmd):
@@ -306,6 +340,21 @@ class Multitool:
     # 主流程：换热端
     # ------------------------------------------------------------------
     def _do_change_tool(self, gcmd, new_tool):
+        if self.heater_mode != 'shared' or self.active:
+            return self._change_tool(gcmd, new_tool)
+        try:
+            return self._change_tool(gcmd, new_tool)
+        except Exception:
+            # Includes failures in entry checks, motion/state restoration,
+            # offset application and temperature waiting, not only the hooks.
+            self._shared_heater_shutdown()
+            raise
+        finally:
+            self.active = False
+            self.change_from_tool = -1
+            self.change_to_tool = -1
+
+    def _change_tool(self, gcmd, new_tool):
         # ---- 重入保护 ----
         # G-code 是串行的，但用户钩子宏内部仍可能误触发 T*/CHANGE_TOOL/UNTOOL，
         # 形成嵌套调用。嵌套会破坏 saved_accel / SAVE_GCODE_STATE 名字 /
@@ -327,6 +376,14 @@ class Multitool:
             self._copy_tool_heater_target(requested_tool, new_tool)
 
         if new_tool == old_tool:
+            if self.heater_mode == 'shared':
+                if new_tool < 0:
+                    self._suspend_shared_heater()
+                elif self._shared_heater_fault:
+                    raise self.printer.command_error(
+                        '[multitool] Shared heater is locked after a failed '
+                        'tool change. Check the mounted tool, then unload '
+                        'and pick it up again before heating.')
             cur_cn = "无热端" if new_tool == -1 else "T%d" % new_tool
             gcmd.respond_info(
                 "目标状态与当前一致 (%s)，无需机械换头" % cur_cn)
@@ -390,14 +447,22 @@ class Multitool:
             if stats is not None:
                 stats.tc_begin()
 
-            # ---- 释放旧热端 ----
+            # Retract while the old tool is still mounted and hot. Shared
+            # heating must then be off before either mechanical hook starts.
             if old_tool != -1:
                 self._extrude_tool(
                     old_tool, -self.extrude_compensation_length,
                     self.extrude_compensation_speed, '释放前回抽')
+            if self.heater_mode == 'shared':
+                self._suspend_shared_heater()
+
+            # ---- 释放旧热端 ----
+            if old_tool != -1:
                 if stats is not None:
                     stats.stage_begin('release')
                 self._invoke_hook('multitool_release_tool', old_tool)
+                if self.heater_mode == 'shared':
+                    self.gcode.run_script_from_command('M400')
                 if stats is not None:
                     stats.stage_end('release')
                 if clamp is not None:
@@ -412,11 +477,15 @@ class Multitool:
                 if stats is not None:
                     stats.stage_begin('pickup')
                 self._invoke_hook('multitool_pickup_tool', new_tool)
+                if self.heater_mode == 'shared':
+                    self.gcode.run_script_from_command('M400')
                 if stats is not None:
                     stats.stage_end('pickup')
                 if clamp is not None:
                     clamp.assert_state('clamped', reason='抓取后校验')
                 self._set_current_tool(new_tool, sync_extruder=False)
+                if self.heater_mode == 'shared':
+                    self._resume_shared_heater(new_tool)
 
                 # 等温
                 if stats is not None:
@@ -461,7 +530,12 @@ class Multitool:
         return not self._toolhead_homed(toolhead, 'xyz')
 
     def _do_unhomed_untool(self, gcmd):
-        self._prepare_unhomed_untool()
+        try:
+            self._prepare_unhomed_untool()
+        except Exception:
+            if self.heater_mode == 'shared':
+                self._shared_heater_shutdown()
+            raise
         self._do_change_tool(gcmd, -1)
 
     def _toolhead_homed(self, toolhead, axes):
@@ -589,10 +663,26 @@ class Multitool:
         return s if s > 0. else r
 
     def _set_tool_temperature(self, tool, target):
+        if self.heater_mode == 'shared':
+            self._validate_shared_target(target)
+            if (tool == self.current_tool and target > 0.
+                    and self._shared_heater_fault):
+                raise self.printer.command_error(
+                    '[multitool] Shared heater is locked after a failed '
+                    'tool change; verify and pick up the tool again.')
+            self._tool_targets[tool] = target
+            self._tool_target_set[tool] = True
+            if (tool == self.current_tool
+                    and not self._shared_heater_suspended):
+                self.printer.lookup_object('heaters').set_temperature(
+                    self._shared_heater, target)
+            return
         self.gcode.run_script_from_command(
             "M99104 T%d S%.6f" % (tool, target))
 
     def _wait_temperature(self, tool, target):
+        if self.heater_mode == 'shared':
+            self._assert_shared_tool_ready(tool)
         section = self._tool_extruder_name(tool)
         if self.printer.lookup_object(section, None) is None:
             raise self.printer.command_error(
@@ -600,9 +690,165 @@ class Multitool:
         self.gcode.run_script_from_command(
             "TEMPERATURE_WAIT SENSOR=%s MINIMUM=%.2f MAXIMUM=%.2f"
             % (section, target - 1.5, target + 1.5))
+        if self.heater_mode == 'shared':
+            # Klipper's native wait uses a smoothed temperature. A retained
+            # reading from the previous hot tool must not let a cold pickup
+            # pass the wait and start extrusion before its raw sample is hot.
+            heater = self._shared_heater
+            reactor = self.printer.get_reactor()
+            while True:
+                if self.printer.is_shutdown():
+                    raise self.printer.command_error(
+                        '[multitool] Printer shut down while waiting for '
+                        'the shared heater temperature')
+                self._assert_shared_tool_ready(tool)
+                now = reactor.monotonic()
+                with heater.lock:
+                    raw_temp = heater.last_temp
+                smoothed_temp = heater.get_status(now)['temperature']
+                if (math.isfinite(raw_temp) and math.isfinite(smoothed_temp)
+                        and abs(raw_temp - target) <= 1.5
+                        and abs(smoothed_temp - target) <= 1.5):
+                    return
+                reactor.pause(now + 0.1)
 
     def _tool_extruder_name(self, tool):
+        if self.heater_mode == 'shared':
+            return self.shared_extruder
         return 'extruder' if tool == 0 else 'extruder%d' % tool
+
+    def _configure_shared_heater(self):
+        extruder = self.printer.lookup_object(self.shared_extruder, None)
+        if extruder is None or not hasattr(extruder, 'get_heater'):
+            raise self.printer.config_error(
+                '[multitool] shared_extruder=%s is not a configured extruder'
+                % self.shared_extruder)
+        self._shared_heater = extruder.get_heater()
+        self._shared_native_set_temp = self._shared_heater.set_temp
+
+        def guarded_set_temp(target):
+            self._validate_shared_target(target)
+            if target > 0.:
+                self._assert_shared_tool_ready(self.current_tool)
+            self._shared_native_set_temp(target)
+            if self._shared_heater_suspended or self.current_tool < 0:
+                # An external OFF during a swap must cancel queued reheating.
+                self._clear_shared_targets()
+            else:
+                self._tool_targets[self.current_tool] = target
+                self._tool_target_set[self.current_tool] = True
+
+        # Guard the normal heater API as well as M104/M109: frontend
+        # SET_HEATER_TEMPERATURE and other ordinary callers use set_temp too.
+        # Internal shutdown uses the original method to preserve saved targets.
+        self._shared_heater.set_temp = guarded_set_temp
+        old_turn_off = self.gcode.register_command('TURN_OFF_HEATERS', None)
+        if old_turn_off is None:
+            raise self.printer.config_error(
+                '[multitool] TURN_OFF_HEATERS was not registered')
+
+        def turn_off_all(gcmd):
+            self._clear_shared_targets()
+            old_turn_off(gcmd)
+
+        self.gcode.register_command(
+            'TURN_OFF_HEATERS', turn_off_all,
+            desc='Turn off all heaters and clear shared tool targets')
+
+    def _clear_shared_targets(self):
+        self._tool_targets = [0.] * self.tool_count
+        self._tool_target_set = [True] * self.tool_count
+        self._shared_last_target = 0.
+
+    def _validate_shared_target(self, target):
+        heater = self._shared_heater
+        if (not math.isfinite(target) or target < 0.
+                or (target and not heater.min_temp <= target <= heater.max_temp)):
+            raise self.printer.command_error(
+                '[multitool] Shared heater target %.1f is out of range' % target)
+
+    def _assert_shared_tool_ready(self, tool):
+        if (tool < 0 or tool != self.current_tool
+                or self._shared_heater_suspended or self._shared_heater_fault):
+            raise self.printer.command_error(
+                '[multitool] Shared heater cannot heat or wait for T%d: '
+                'pick up that tool successfully first.' % tool)
+
+    def _suspend_shared_heater(self):
+        self.gcode.run_script_from_command('M400')
+        if self.current_tool >= 0 and not self._shared_heater_suspended:
+            target = self._shared_heater.target_temp
+            self._tool_targets[self.current_tool] = target
+            self._tool_target_set[self.current_tool] = True
+            self._shared_last_target = target
+        self._shared_heater_suspended = True
+        self._shared_native_set_temp(0.)
+
+        # A zero target alone is not an output-off acknowledgement. Wait for
+        # Klipper to report zero PWM, then allow the scheduled PWM to reach
+        # the MCU before permitting release/pickup motion. This is not an
+        # electrical feedback measurement; custom hardware still needs its
+        # own interlocks and commissioning checks.
+        reactor = self.printer.get_reactor()
+        deadline = reactor.monotonic() + self.shared_heater_off_timeout
+        while self._shared_heater.get_status(reactor.monotonic())['power'] != 0.:
+            if self.printer.is_shutdown() or reactor.monotonic() >= deadline:
+                raise self.printer.command_error(
+                    '[multitool] Timed out waiting for shared heater PWM '
+                    'to turn off; mechanical tool change was blocked.')
+            reactor.pause(reactor.monotonic() + 0.05)
+        delay = self._shared_heater.get_pwm_delay()
+        if not math.isfinite(delay) or delay < 0.:
+            raise self.printer.command_error(
+                '[multitool] Invalid shared heater PWM scheduling delay')
+        reactor.pause(reactor.monotonic() + delay + 0.1)
+        if self.printer.is_shutdown():
+            raise self.printer.command_error(
+                '[multitool] Printer shut down while disabling shared heater')
+
+    def _resume_shared_heater(self, tool):
+        # A fixed sensor may still contain the previous tool's hot reading.
+        # Require a valid sample newer than the completed pickup motion before
+        # enabling heat or allowing the usual temperature/extrusion checks.
+        self._wait_shared_sensor()
+        if not self._tool_target_set[tool]:
+            self._tool_targets[tool] = self._shared_last_target
+            self._tool_target_set[tool] = True
+        self._shared_heater_suspended = False
+        self._shared_heater_fault = False
+        self.printer.lookup_object('heaters').set_temperature(
+            self._shared_heater, self._tool_targets[tool])
+
+    def _wait_shared_sensor(self):
+        heater = self._shared_heater
+        reactor = self.printer.get_reactor()
+        pickup_time = self.printer.lookup_object('toolhead').get_last_move_time()
+        deadline = reactor.monotonic() + self.shared_heater_sensor_timeout
+        while True:
+            now = reactor.monotonic()
+            if self.printer.is_shutdown():
+                raise self.printer.command_error(
+                    '[multitool] Printer shut down while waiting for '
+                    'the shared temperature sensor')
+            with heater.lock:
+                sample_time, temp = heater.last_temp_time, heater.last_temp
+            if (sample_time > pickup_time and math.isfinite(temp)
+                    and heater.min_temp <= temp <= heater.max_temp):
+                return
+            if now >= deadline:
+                raise self.printer.command_error(
+                    '[multitool] No valid shared temperature sample after '
+                    'pickup; heating remains disabled.')
+            reactor.pause(now + 0.05)
+
+    def _shared_heater_shutdown(self):
+        self._shared_heater_suspended = True
+        self._shared_heater_fault = True
+        if self._shared_native_set_temp is not None:
+            try:
+                self._shared_native_set_temp(0.)
+            except Exception:
+                logging.exception('multitool: could not disable shared heater')
 
     def _tool_temperature(self, tool, extruder):
         eventtime = self.printer.get_reactor().monotonic()
@@ -620,6 +866,10 @@ class Multitool:
 
     def _tool_can_extrude(self, tool, label):
         if tool < 0 or tool >= self.tool_count:
+            return False
+        if (self.heater_mode == 'shared'
+                and (tool != self.current_tool or self._shared_heater_suspended
+                     or self._shared_heater_fault)):
             return False
         section = self._tool_extruder_name(tool)
         extruder = self.printer.lookup_object(section, None)
@@ -659,6 +909,8 @@ class Multitool:
     def _heater_target(self, tool):
         if tool < 0 or tool >= self.tool_count:
             return None
+        if self.heater_mode == 'shared':
+            return self._tool_targets[tool]
         extruder = self.printer.lookup_object(
             self._tool_extruder_name(tool), None)
         if extruder is None:
@@ -800,7 +1052,7 @@ class Multitool:
         # 不做 last_temp 提前短路：升温时多走一次 TEMPERATURE_WAIT 没问题，
         # 但降温时短路会误判（last_temp 仍在高位），因此交给 TEMPERATURE_WAIT
         # 自身处理（用 MINIMUM/MAXIMUM 双向收敛）。
-        section = 'extruder' if tool == 0 else 'extruder%d' % tool
+        section = self._tool_extruder_name(tool)
         extruder = self.printer.lookup_object(section, None)
         if extruder is None:
             return
@@ -811,9 +1063,7 @@ class Multitool:
         if target <= HEAT_WAIT_MIN_TARGET:
             return
         self.gcode.respond_info("T%d 等温中 (target=%.1f)..." % (tool, target))
-        self.gcode.run_script_from_command(
-            "TEMPERATURE_WAIT SENSOR=%s MINIMUM=%.2f MAXIMUM=%.2f"
-            % (section, target - 1.5, target + 1.5))
+        self._wait_temperature(tool, target)
 
     # ------------------------------------------------------------------
     # 暴露给前端 / 宏
@@ -842,7 +1092,28 @@ class Multitool:
             'extrude_compensation_speed':
                 self.extrude_compensation_speed,
             'min_extrude_temps': list(self._min_extrude_temps),
+            'heater_mode': self.heater_mode,
+            'shared_extruder': (self.shared_extruder
+                                if self.heater_mode == 'shared' else None),
+            'shared_heater_suspended': (self._shared_heater_suspended
+                                       if self.heater_mode == 'shared' else False),
+            'shared_heater_fault': self._shared_heater_fault,
+            'tool_extruders': [self._tool_extruder_name(i)
+                               for i in range(self.tool_count)],
+            'tool_target_temperatures': [self._heater_target(i)
+                                         for i in range(self.tool_count)],
+            # A fixed sensor only measures the mounted tool; do not report
+            # its temperature as a measurement of parked, unobserved tools.
+            'tool_temperatures': [self._status_tool_temperature(i)
+                                   for i in range(self.tool_count)],
         }
+
+    def _status_tool_temperature(self, tool):
+        if (self.heater_mode == 'shared'
+                and (tool != self.current_tool or self._shared_heater_suspended)):
+            return None
+        extruder = self.printer.lookup_object(self._tool_extruder_name(tool), None)
+        return None if extruder is None else self._tool_temperature(tool, extruder)
 
 
 def load_config(config):

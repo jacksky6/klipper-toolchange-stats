@@ -383,11 +383,9 @@ class MultitoolFilament:
     # 读取某热端 extruder 的目标温度；查不到 extruder 返回 None。
     # ------------------------------------------------------------------
     def _heater_target(self, tool):
-        section = 'extruder' if tool == 0 else 'extruder%d' % tool
-        extruder = self.printer.lookup_object(section, None)
-        if extruder is None:
-            return None
-        return extruder.get_heater().target_temp
+        # Keep temperature ownership in multitool: shared mode has cached
+        # logical targets, and closing the old tool must not cool the new one.
+        return self.multitool._heater_target(tool)
 
     # ------------------------------------------------------------------
     # 生成一条把当前 toolhead 速度限制写回的 SET_VELOCITY_LIMIT 命令。
